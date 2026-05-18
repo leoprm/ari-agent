@@ -337,7 +337,6 @@ def _process_single_prompt(
             providers_ignored=config.get("providers_ignored"),
             providers_order=config.get("providers_order"),
             provider_sort=config.get("provider_sort"),
-            openrouter_min_coding_score=config.get("openrouter_min_coding_score"),
             max_tokens=config.get("max_tokens"),
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),

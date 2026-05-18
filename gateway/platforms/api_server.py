@@ -35,6 +35,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -890,6 +891,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # Tree-scoped memory: extract treeId from gateway_session_key (format: tree-agent-<uuid>)
+        tree_memory_path = None
+        if gateway_session_key and gateway_session_key.startswith("tree-agent-"):
+            tree_id = gateway_session_key[len("tree-agent-"):]
+            tree_memory_path = f"/home/trustmaker/trees/{tree_id}/memory/"
+
+            # Auto-create memory directory and empty MD files if they don't exist
+            Path(tree_memory_path).mkdir(parents=True, exist_ok=True)
+            for md_file in ("MEMORY.md", "memory_private.md", "USER.md"):
+                md_path = Path(tree_memory_path) / md_file
+                if not md_path.exists():
+                    md_path.touch()
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -907,8 +921,14 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            tree_memory_path=tree_memory_path,
             gateway_session_key=gateway_session_key,
         )
+        # Tree sessions: block session_search (cross-tree data leak + timeout issues)
+        if gateway_session_key and gateway_session_key.startswith("tree-agent-"):
+            agent.tools = [t for t in agent.tools if t.get("function", {}).get("name") != "session_search"]
+            agent.valid_tool_names.discard("session_search")
+
         return agent
 
     # ------------------------------------------------------------------
@@ -1061,14 +1081,56 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
-                conversation_messages.append({"role": role, "content": content})
+                entry: Dict[str, Any] = {"role": role, "content": content}
+                # Preserve tool_calls so the agent sees the full assistant context
+                # when the client sends conversation history with tool interactions.
+                raw_tool_calls = msg.get("tool_calls")
+                if role == "assistant" and isinstance(raw_tool_calls, list) and raw_tool_calls:
+                    entry["tool_calls"] = raw_tool_calls
+                # Preserve tool_call_id and name on assistant messages (OpenAI
+                # includes these to disambiguate which tool was called).
+                tc_id = msg.get("tool_call_id")
+                if role == "assistant" and tc_id:
+                    entry["tool_call_id"] = tc_id
+                tc_name = msg.get("name") or msg.get("function", {}).get("name")
+                if role == "assistant" and tc_name:
+                    entry["name"] = tc_name
+                conversation_messages.append(entry)
+            elif role == "tool":
+                # Tool result messages carry tool_call_id and name — preserve
+                # them so the agent can reconstruct the full tool interaction
+                # history when the client sends multi-turn conversations.
+                tool_content = _normalize_chat_content(raw_content)
+                tool_entry: Dict[str, Any] = {"role": "tool", "content": tool_content}
+                tc_id = msg.get("tool_call_id")
+                if tc_id:
+                    tool_entry["tool_call_id"] = tc_id
+                tc_name = msg.get("name")
+                if tc_name:
+                    tool_entry["name"] = tc_name
+                conversation_messages.append(tool_entry)
 
-        # Extract the last user message as the primary input
+        # Extract the last USER message as the primary input.
+        # Must walk backwards through conversation_messages because tool
+        # messages may now be present between user/assistant messages.
         user_message: Any = ""
         history = []
         if conversation_messages:
-            user_message = conversation_messages[-1].get("content", "")
-            history = conversation_messages[:-1]
+            # Find the last user message for the primary input
+            for _m in reversed(conversation_messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    user_message = _m.get("content", "")
+                    break
+            # History is everything up to (but not including) the last user message
+            if user_message:
+                _last_user_idx = next(
+                    (i for i in range(len(conversation_messages) - 1, -1, -1)
+                     if isinstance(conversation_messages[i], dict)
+                     and conversation_messages[i].get("role") == "user"),
+                    -1,
+                )
+                if _last_user_idx >= 0:
+                    history = conversation_messages[:_last_user_idx]
 
         if not _content_has_visible_payload(user_message):
             return web.json_response(
@@ -1263,6 +1325,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = result.get("final_response") or ""
+        # Fallback: if final_response is unexpectedly empty but the agent
+        # produced assistant messages with content (e.g. after tool calls
+        # where the loop's final_response variable was not properly set),
+        # extract the last assistant message content from the messages list.
+        if not final_response:
+            _msgs = result.get("messages") or []
+            for _m in reversed(_msgs):
+                if isinstance(_m, dict) and _m.get("role") == "assistant":
+                    _c = _m.get("content")
+                    if isinstance(_c, str) and _c.strip():
+                        final_response = _c
+                        break
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
