@@ -71,6 +71,71 @@ def _ra():
     return run_agent
 
 
+def _normalized_custom_base_url(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().rstrip("/")
+
+
+def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
+    provider_model = str(entry.get("model", "") or "").strip().lower()
+    if not provider_model:
+        return True
+    return provider_model == str(agent_model or "").strip().lower()
+
+
+def _custom_provider_extra_body_for_agent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if (provider or "").strip().lower() != "custom":
+        return None
+
+    target_url = _normalized_custom_base_url(base_url)
+    if not target_url:
+        return None
+
+    fallback: Optional[Dict[str, Any]] = None
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
+            continue
+        extra_body = entry.get("extra_body")
+        if not isinstance(extra_body, dict) or not extra_body:
+            continue
+        provider_model = str(entry.get("model", "") or "").strip()
+        if provider_model:
+            if _custom_provider_model_matches(model, entry):
+                return dict(extra_body)
+        elif fallback is None:
+            fallback = dict(extra_body)
+
+    return fallback
+
+
+def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
+    extra_body = _custom_provider_extra_body_for_agent(
+        provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        custom_providers=custom_providers,
+    )
+    if not extra_body:
+        return
+
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    merged_extra_body = dict(extra_body)
+    existing_extra_body = overrides.get("extra_body")
+    if isinstance(existing_extra_body, dict):
+        merged_extra_body.update(existing_extra_body)
+    overrides["extra_body"] = merged_extra_body
+    agent.request_overrides = overrides
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -560,7 +625,16 @@ def init_agent(
             agent._client_kwargs = {}
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (Anthropic native)")
-                if effective_key and len(effective_key) > 12:
+                # ``effective_key`` may be a callable Entra ID bearer
+                # provider for Azure Foundry anthropic_messages mode.
+                # The Anthropic adapter installs an httpx event hook
+                # that mints a fresh JWT per request — we never
+                # invoke or inspect the callable in the banner.
+                from agent.azure_identity_adapter import is_token_provider
+
+                if is_token_provider(effective_key):
+                    print("🔑 Using credentials: Microsoft Entra ID")
+                elif isinstance(effective_key, str) and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
     elif agent.api_mode == "bedrock_converse":
         # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
@@ -764,12 +838,19 @@ def init_agent(
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
                 if base_url:
                     print(f"🔗 Using custom base URL: {base_url}")
-                # Always show API key info (masked) for debugging auth issues
+                # ``api_key`` may be a callable Entra ID bearer
+                # provider (Azure Foundry). The OpenAI SDK mints a
+                # fresh JWT per request internally — the banner
+                # never invokes or inspects the callable.
+                from agent.azure_identity_adapter import is_token_provider
+
                 key_used = client_kwargs.get("api_key", "none")
-                if key_used and key_used != "dummy-key" and len(key_used) > 12:
+                if is_token_provider(key_used):
+                    print("🔑 Using credentials: Microsoft Entra ID")
+                elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
                     print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
                 else:
-                    print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+                    print("⚠️  Warning: API key appears invalid or missing")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
     
@@ -812,7 +893,6 @@ def init_agent(
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
-            
             # Show filtering info if applied
             if enabled_toolsets:
                 print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
@@ -820,7 +900,18 @@ def init_agent(
                 print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
-    
+
+    # Kanban worker/orchestrator lifecycle guidance is session-static:
+    # the dispatcher decides at spawn time whether this process is a kanban
+    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
+    # Resolving the ~835-token block once here avoids re-running the
+    # membership test + reference on every system-prompt rebuild
+    # (init + each context compression).
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    agent._kanban_worker_guidance = (
+        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    )
+
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
         requirements = _ra().check_toolset_requirements()
@@ -875,7 +966,19 @@ def init_agent(
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
-    agent.session_log_file = agent.logs_dir / f"session_{agent.session_id}.json"
+    # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
+    # is opt-in via sessions.write_json_snapshots (default False).  state.db
+    # is canonical — the snapshot is only useful for external tooling that
+    # reads the JSON files directly.  See run_agent._save_session_log.
+    agent._session_json_enabled = False
+    try:
+        from hermes_cli.config import load_config as _load_sess_cfg
+        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+    except Exception:
+        pass
+    # logs_dir is retained unconditionally for request_dump_*.json (debug
+    # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []
@@ -1089,6 +1192,9 @@ def init_agent(
     compression_protect_first = max(
         0, int(_compression_cfg.get("protect_first_n", 3))
     )
+    compression_abort_on_summary_failure = str(
+        _compression_cfg.get("abort_on_summary_failure", False)
+    ).lower() in {"true", "1", "yes"}
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -1172,6 +1278,7 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
+    _merge_custom_provider_extra_body(agent, _custom_providers)
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
@@ -1303,6 +1410,7 @@ def init_agent(
             config_context_length=_config_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
+            abort_on_summary_failure=compression_abort_on_summary_failure,
         )
     agent.compression_enabled = compression_enabled
 
@@ -1395,7 +1503,12 @@ def init_agent(
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
     if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
         try:
-            _detected = query_ollama_num_ctx(agent.model, agent.base_url, api_key=agent.api_key or "")
+            # ``agent.api_key`` may be a callable (Entra token provider).
+            # Ollama detection makes a manual HTTP request and expects a
+            # string — Azure Foundry isn't a local endpoint so this branch
+            # never fires for Entra, but guard defensively.
+            _key_for_ollama = agent.api_key if isinstance(agent.api_key, str) else ""
+            _detected = query_ollama_num_ctx(agent.model, agent.base_url, api_key=_key_for_ollama or "")
             if _detected and _detected > 0:
                 agent._ollama_num_ctx = _detected
         except Exception as exc:
@@ -1431,7 +1544,13 @@ def init_agent(
     # Gateway status_callback is not yet wired, so any warning is stored
     # in _compression_warning and replayed in the first run_conversation().
     agent._compression_warning = None
-    agent._check_compression_model_feasibility()
+    # Lazy feasibility check: deferred to the first turn that approaches the
+    # compression threshold. Running it eagerly here costs ~400ms cold (network
+    # probe of the auxiliary provider chain + /models lookup) on every agent
+    # init, including short ``chat -q`` runs that never reach the threshold.
+    # ``ensure_compression_feasibility_checked`` (called from
+    # ``run_conversation``'s preflight) runs it at most once per agent.
+    agent._compression_feasibility_checked = False
 
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the
