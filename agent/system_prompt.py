@@ -243,6 +243,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+        # LECCIONES.md — IA improvement lessons (no PII), always included when enabled.
+        if agent._lessons_enabled:
+            lessons_block = agent._memory_store.format_for_system_prompt("lessons")
+            if lessons_block:
+                volatile_parts.append(lessons_block)
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
